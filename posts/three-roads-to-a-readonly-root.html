@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Three Roads to a Read-Only Root</title>
+<meta name="description" content="Ubuntu's overlayroot, RHEL's readonly-root, and SUSE's systemd.volatile — three house mechanisms for a root filesystem that forgets, and why the distro decision was actually made somewhere else entirely.">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+<meta property="og:title" content="Three Roads to a Read-Only Root">
+<meta property="og:description" content="Ubuntu's overlayroot, RHEL's readonly-root, and SUSE's systemd.volatile — three house mechanisms for a root filesystem that forgets, and why the distro decision was actually made somewhere else entirely.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://chronicblondiee.github.io/tech-blog/posts/three-roads-to-a-readonly-root.html">
+<meta name="twitter:card" content="summary">
+<link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="../index.html"><span class="logo-mark">c</span>chronicblondiee<span class="dot">.</span>tech</a>
+    <nav class="site">
+      <a href="../index.html">Posts</a>
+      <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc">Source</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <a class="back-link" href="../index.html"><span class="arrow">&larr;</span><span>All posts</span></a>
+
+  <span class="tag">infra</span><span class="tag">linux</span><span class="tag">distros</span>
+
+  <h1>Three Roads to a Read-Only Root</h1>
+  <div class="post-meta">July 2026 &middot; POC writeup &middot; full source in <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc"><code>/poc</code></a></div>
+
+  <p class="lede">
+    Five posts in this series have said "SUSE" like it was obvious. It
+    wasn't. The repo still carries the fossils of the decision: two
+    evaluation notes stamped <em>LEGACY REFERENCE</em> at the top, and a
+    build script that refuses to run without zypper and admits, right in
+    the error message, that "older Ubuntu/RHEL build logic was removed when
+    the fleet standardized on SUSE." This is the story of that
+    standardization — three distros, three house mechanisms for a root
+    filesystem that forgets, and a winner chosen for reasons that mostly
+    weren't the mechanisms.
+  </p>
+
+  <h2>What I was shopping for</h2>
+  <p>
+    The requirements were short. One golden image. A root that forgets
+    writes — because even with
+    <a href="pxe-ram-boot-pipeline.html">RAM-boot as the primary path</a>,
+    the disk-deploy fallback for RAM-poor hardware needs statelessness too.
+    And the smallest possible pile of distro-specific tooling to own,
+    because every distro-flavored mechanism in the design is something I
+    have to re-learn at every major version bump.
+  </p>
+
+  <h2>Ubuntu: overlayroot, the ergonomic winner</h2>
+  <p>
+    Ubuntu's answer is the <code>overlayroot</code> package, and credit
+    where due — it has the best ergonomics of the three. One line:
+  </p>
+  <pre><code># /etc/overlayroot.conf
+overlayroot="tmpfs:swap=1,recurse=0"</code></pre>
+  <p>
+    …or the same string as a kernel argument, and the initramfs mounts a
+    tmpfs overlay on the read-only root before systemd ever runs. It even
+    ships a maintenance escape hatch: <code>overlayroot-chroot</code> drops
+    you into the real read-write disk underneath when you genuinely want a
+    change to stick. Two wrinkles, though. The deployment lifecycle wants
+    the <em>first</em> boot after imaging to be read-write so cloud-init
+    can specialize the clone, with statelessness starting at boot two —
+    solvable by moving specialization into the vault, which
+    <a href="inside-the-keytab-vault-infisical.html">this design did
+    anyway</a>. And the wrinkle that actually mattered: Ubuntu's live and
+    netboot world is casper and initramfs-tools, so the RAM-boot primary
+    path means installing <code>casper</code> into the golden image and
+    adopting its boot arguments. The best fallback mechanism of the three
+    came attached to the most bespoke primary path.
+  </p>
+
+  <h2>RHEL: readonly-root, the enumerate-your-writes model</h2>
+  <p>
+    RHEL has no overlayroot package; its native pattern is philosophically
+    different. An overlay says "write anywhere you like, it evaporates."
+    RHEL's <code>readonly-root</code> says "writes fail unless the path is
+    on the list":
+  </p>
+  <pre><code># /etc/sysconfig/readonly-root
+READONLY=yes
+TEMPORARY_STATE=yes
+
+# /etc/rwtab.d/sssd-poc — the POC's whitelist
+files  /etc/krb5.keytab
+dirs   /var/lib/sss
+dirs   /var/log/sssd</code></pre>
+  <p>
+    Everything in <code>rwtab</code> gets a tmpfs shadow; everything else
+    is genuinely read-only. There's real rigor in that — the whitelist
+    <em>documents</em> exactly what your system mutates, which the overlay
+    model never forces you to learn. And to be fair on the primary path:
+    dracut is a Red Hat project, livenet included, so RHEL RAM-boots the
+    same way SUSE does, stock. What wore me down was SELinux. A keytab
+    written at boot time by a script needs its file context handled, or
+    SSSD gets denied reading it:
+  </p>
+  <pre><code>semanage fcontext -a -t krb5_keytab_t /etc/krb5.keytab   # once, at image build
+restorecon -v /etc/krb5.keytab                            # every boot, post-fetch</code></pre>
+  <p>
+    Not a blocker — two lines, written down in the notes. But it's a tax
+    levied on every future change to the boot flow: each new file the
+    fetch script touches is a fresh conversation with the policy. On a
+    fleet whose entire identity model is "a script writes a credential
+    into <code>/etc</code> at boot," that conversation never ends.
+  </p>
+
+  <h2>SUSE: the mechanism that isn't a distro feature</h2>
+  <p>
+    SUSE has no overlayroot either, and its answer barely counts as a
+    SUSE answer:
+  </p>
+  <pre><code># one kernel argument — systemd does the rest
+systemd.volatile=overlay
+
+# wired into the disk-fallback image via grub:
+GRUB_CMDLINE_LINUX_DEFAULT="systemd.volatile=overlay ..."
+grub2-mkconfig -o /boot/grub2/grub.cfg</code></pre>
+  <p>
+    That's systemd's native volatile mode — a tmpfs OverlayFS upper layer
+    assembled over the root in the initramfs, disk used read-only. No
+    package, no distro patch, just upstream systemd behavior that SUSE
+    doesn't get in the way of. The rest of the platform had the same
+    texture: AppArmor's default SSSD profile already permits
+    <code>/etc/krb5.keytab</code>, so the boot-time keytab write needs no
+    relabeling ritual at all; <code>pam-config --sss --mkhomedir</code>
+    wires PAM idempotently; and openSUSE Leap is binary-compatible with
+    SLES 15, so the POC ran license-free on Leap with a straight face
+    about flipping to registered SLES for production. SUSE charged its
+    own tolls, to be clear: wicked — the default network stack, which
+    wants a config file per interface — had to be disabled in favor of
+    NetworkManager's match-all DHCP; SLES golden VMs need the
+    <code>SUSEConnect</code> register-then-deregister ritual so the sealed
+    image doesn't carry credentials; and SUSE names its initramfs
+    <code>/boot/initrd-&lt;kver&gt;</code> where everyone else has an
+    <code>.img</code>, a quirk the squashfs build script papers over with
+    a three-way fallback.
+  </p>
+
+  <h2>The scorecard</h2>
+  <div class="diagram">                 Ubuntu              RHEL                SUSE
+volatile root    overlayroot pkg     readonly-root +     systemd.volatile=
+                 (one conf line)     rwtab whitelist     overlay (kernel arg)
+live RAM-boot    casper (add-on)     dracut livenet      dracut livenet
+                                     (stock)             (stock)
+keytab-at-boot   AppArmor:           SELinux: needs      AppArmor:
+vs MAC security  fine as shipped     krb5_keytab_t       fine as shipped
+PAM wiring       pam-auth-update     authselect          pam-config</div>
+
+  <h2>The real decider</h2>
+  <p>
+    Here's the thing the scorecard hides: all three fallback mechanisms
+    were workable. If the volatile root had been the whole decision, I'd
+    probably have shipped Ubuntu and its one-line overlayroot. The
+    decision actually got made on the primary path, by a principle I only
+    articulated afterwards: <strong>minimize the moving parts you own, and
+    prefer the ones that are upstream plumbing rather than distro
+    personality.</strong> Everything the RAM-boot design leans on — dracut
+    livenet, systemd's volatile mode, NetworkManager, chrony, SSSD — is
+    generic upstream infrastructure. SUSE was the distro that shipped all
+    of it stock and then got out of the way: no casper bolted on, no
+    SELinux policy conversation renewing itself every quarter. "Choosing
+    SUSE" was really choosing to depend on plumbing that would look the
+    same on any distro that carries it.
+  </p>
+  <p>
+    And the honest footnote: the Ubuntu and RHEL notes weren't deleted.
+    They sit in the repo under their LEGACY banners, kept deliberately,
+    because fleets are rarely pure — the day a mixed estate shows up, the
+    rwtab whitelist and the overlayroot lifecycle notes are the head start.
+    Standardizing on one road doesn't mean forgetting you mapped the other
+    two.
+  </p>
+
+  <hr>
+  <p>
+    All three evaluations live in
+    <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc/05-stateless-boot"><code>05-stateless-boot/</code></a>
+    — start with <code>suse-stateless-notes.md</code> for the road taken,
+    then <code>ubuntu-overlayroot.md</code> and
+    <code>rhel-readonly-root.md</code> for the roads not. That wraps the
+    roads-not-taken material from this POC; if your fleet walked one of
+    the other two roads and it's working, I'd honestly love the
+    counterexample.
+  </p>
+
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <span>Thanks for reading. This came out of a working proof-of-concept — go break it and tell me what I missed.</span>
+    <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+      <span>Source</span>
+    </a>
+  </div>
+</footer>
+
+</body>
+</html>

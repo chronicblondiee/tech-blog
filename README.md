@@ -16,6 +16,11 @@ poc/          — source for proof-of-concept work referenced in posts
 
 ## Posts
 
+- [Three Roads to a Read-Only Root](posts/three-roads-to-a-readonly-root.html)
+  — the distro decision behind the POC: Ubuntu's overlayroot vs RHEL's
+  readonly-root/rwtab vs SUSE's systemd.volatile=overlay, and why the
+  choice was really made by the RAM-boot path and the security stack, not
+  the volatile-root mechanisms.
 - [Booting Is Deployment: MAAS, FOG, and the Problem That Disappeared](posts/booting-is-deployment.html)
   — the deployment systems evaluated for the POC and demoted to the
   disk-deploy fallback once RAM-boot removed the disk itself, plus the two
