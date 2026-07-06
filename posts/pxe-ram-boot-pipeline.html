@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Streaming an OS into RAM: The PXE Boot Pipeline</title>
+<meta name="description" content="How my diskless fleet actually boots: a DHCP server that never hands out IPs, a 30-line iPXE script shared by every node, dracut streaming a squashfs into RAM, and a deployment system that is one symlink.">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+<meta property="og:title" content="Streaming an OS into RAM: The PXE Boot Pipeline">
+<meta property="og:description" content="How my diskless fleet actually boots: a DHCP server that never hands out IPs, a 30-line iPXE script shared by every node, dracut streaming a squashfs into RAM, and a deployment system that is one symlink.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://chronicblondiee.github.io/tech-blog/posts/pxe-ram-boot-pipeline.html">
+<meta name="twitter:card" content="summary">
+<link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="../index.html"><span class="logo-mark">c</span>chronicblondiee<span class="dot">.</span>tech</a>
+    <nav class="site">
+      <a href="../index.html">Posts</a>
+      <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc">Source</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <a class="back-link" href="../index.html"><span class="arrow">&larr;</span><span>All posts</span></a>
+
+  <span class="tag">infra</span><span class="tag">linux</span><span class="tag">pxe</span>
+
+  <h1>Streaming an OS into RAM: The PXE Boot Pipeline</h1>
+  <div class="post-meta">July 2026 &middot; POC deep dive &middot; full source in <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc"><code>/poc</code></a></div>
+
+  <p class="lede">
+    <a href="stateless-bare-metal-linux-sssd.html">The first post</a> laid out
+    the architecture and <a href="inside-the-keytab-vault-infisical.html">the
+    second</a> opened up the keystore, but both of them waved at the actual
+    boot with one ASCII diagram. This post is that diagram at full
+    resolution: how a powered-off box with no disk ends up running a complete
+    OS out of RAM. The whole pipeline turns out to be a DHCP server that
+    never hands out IPs, a thirty-line boot script shared by every machine I
+    own, and a deployment system that is — genuinely — one symlink.
+  </p>
+
+  <h2>Why RAM-boot beat disk deploy</h2>
+  <p>
+    I kept a disk-based fallback (write the image to disk, mount an overlay
+    on top), and building both taught me why RAM-boot wins for this fleet.
+    Statelessness stops being a discipline and becomes physics: with nothing
+    written to disk, a power cycle <em>is</em> a factory reset, and there is
+    no overlay-escape hatch to audit because there is nothing under the
+    overlay. Just as important for a pile of mismatched hardware: no disk
+    bootloader means no hybrid BIOS/UEFI GRUB gymnastics, no partition
+    geometry, no fstab UUIDs — the only thing that has to understand the
+    hardware is the kernel and its initramfs. And image rollout collapses
+    into "update one file on the PXE server"; the entire fleet is on the new
+    image at its next reboot.
+  </p>
+  <p>
+    The honest costs: every boot pulls roughly 1.5&ndash;2.5&nbsp;GB over the
+    network, the practical RAM floor is about 8&nbsp;GB per node (the image
+    lives in memory twice during the copy, then the working set on top), and
+    the PXE server becomes a hard dependency <em>at boot time</em>. I'll come
+    back to why that last one is much less scary than it sounds.
+  </p>
+
+  <h2>Stage one: the DHCP server that never hands out an IP</h2>
+  <p>
+    The part of PXE that scares people is DHCP, because it sounds like you
+    need to touch the corporate DHCP server — set option 66/67, negotiate
+    with whoever owns it, and explain yourself when something breaks. You
+    don't. dnsmasq has a <strong>proxyDHCP</strong> mode where it answers PXE
+    clients <em>alongside</em> the real DHCP server: the corporate server
+    keeps handing out IPs exactly as before, and dnsmasq supplements only the
+    boot options. Nobody's scopes get edited. The trimmed config:
+  </p>
+  <pre><code># proxyDHCP: corporate DHCP keeps the leases; we only add boot options
+dhcp-range=10.10.20.0,proxy
+
+# architecture detection (RFC 4578 option 93)
+dhcp-match=set:bios,option:client-arch,0
+dhcp-match=set:efi64,option:client-arch,7
+dhcp-match=set:efi64,option:client-arch,9
+# iPXE announces itself via user-class — this breaks the chainload loop:
+dhcp-userclass=set:ipxe,iPXE
+
+# stage 1: firmware PXE ROM -&gt; tiny iPXE binary over TFTP
+dhcp-boot=tag:bios,tag:!ipxe,undionly.kpxe
+dhcp-boot=tag:efi64,tag:!ipxe,ipxe.efi
+# stage 2: iPXE -&gt; full boot script over HTTP
+dhcp-boot=tag:ipxe,http://deploy.poc.lan/boot.ipxe
+
+enable-tftp
+tftp-root=/srv/tftp</code></pre>
+  <p>
+    Three tricks in sixteen lines. The <code>dhcp-match</code> rules read
+    option 93 to tell a dusty BIOS ROM from a UEFI one and serve each the
+    right flavor of iPXE binary. The <code>dhcp-userclass</code> line is the
+    one everyone forgets: once iPXE is running it does DHCP <em>again</em>,
+    and without that tag it would be handed <code>undionly.kpxe</code> a
+    second time and chainload itself forever — iPXE marks its requests with a
+    user-class precisely so the server can hand it the real boot script
+    instead. And TFTP, the slowest protocol still in production use, carries
+    exactly one thing: an iPXE binary measured in kilobytes. Everything heavy
+    moves over HTTP. (One more footgun the setup script handles: dnsmasq is
+    also a DNS server by default and will fight systemd-resolved for port 53,
+    so it gets <code>port=0</code> to run as pure DHCP-proxy/TFTP.)
+  </p>
+
+  <h2>Stage two: one boot script for the entire fleet</h2>
+  <p>
+    Everything after the firmware handoff is driven by a single iPXE script,
+    short enough to quote nearly whole:
+  </p>
+  <pre><code>#!ipxe
+set base http://deploy.poc.lan/images/current
+
+echo === Stateless SSSD RAM-boot ===
+echo MAC ${net0/mac}  |  image base: ${base}
+
+kernel ${base}/vmlinuz \
+  root=live:${base}/root.squashfs \
+  rd.live.ram=1 \
+  rd.live.overlay.overlayfs=1 \
+  rd.live.dir=/ rd.live.squashimg=root.squashfs \
+  rd.neednet=1 ip=dhcp rd.timeout=120 \
+  console=tty0 console=ttyS0,115200n8 \
+  systemd.hostname=localhost || goto failed
+
+initrd ${base}/initrd.img || goto failed
+boot || goto failed
+
+:failed
+echo Boot failed — retrying DHCP + chain in 10s
+sleep 10
+dhcp
+chain http://deploy.poc.lan/boot.ipxe</code></pre>
+  <p>
+    There is no per-node configuration in this file, and that's not laziness
+    — it's the design. Identity doesn't exist at boot time; it's assigned
+    later, in userspace, when the keytab-fetch service asks the vault "who am
+    I?" keyed by NIC MAC. That's also why
+    <code>systemd.hostname=localhost</code> is set explicitly: it's a
+    placeholder that says <em>nobody at this layer names machines</em>. The
+    kernel command line is where the actual magic hides, flag by flag:
+    <code>root=live:http://&hellip;/root.squashfs</code> tells dracut the
+    root filesystem is a squashfs at the end of a URL;
+    <code>rd.live.ram=1</code> copies it fully into RAM and then releases the
+    network hold, so the running system doesn't depend on the HTTP server
+    staying up; <code>rd.live.overlay.overlayfs=1</code> mounts a tmpfs
+    OverlayFS on top for writes; <code>rd.neednet=1 ip=dhcp</code> brings up
+    whichever NIC answers inside the initramfs; and the dual
+    <code>console=</code> lines mean the same image shows boot output on the
+    local tty <em>and</em> serial-over-LAN, whatever iDRAC or iLO you're
+    staring at. The <code>:failed</code> loop at the bottom is the entire
+    error-handling story: wait ten seconds, re-DHCP, try again, forever.
+    For a stateless node that's correct — there's no local fallback worth
+    falling back to.
+  </p>
+
+  <h2>Stage three: dracut livenet does the heavy lifting</h2>
+  <p>
+    I didn't write any of the hard part. dracut's <code>livenet</code> and
+    <code>dmsquash-live</code> modules — sitting in the stock
+    <code>dracut</code> package on SLES and openSUSE, no add-on repos — do
+    the HTTP fetch, the RAM copy, and the overlay assembly. Crucially,
+    livenet takes a <em>bare</em> squashfs; some netboot schemes make you
+    wrap the image in an ISO and loopback-mount it, and skipping that step
+    keeps the build pipeline one command shorter and one format dumber.
+  </p>
+  <p>
+    The trap is the initramfs, and it's the same hostonly trap from the
+    first post wearing different clothes. SUSE's dracut defaults to
+    <em>hostonly</em> mode: it builds an initramfs containing only the
+    drivers the build machine needs. My golden image is built in a VM, so a
+    default initramfs would know about virtio and precisely nothing else —
+    it would boot beautifully in the build VM and hang at "waiting for
+    network" on every real server in the rack. The golden-image build fixes
+    this with one dracut drop-in:
+  </p>
+  <pre><code># /etc/dracut.conf.d/90-ramboot.conf  (written by RAMBOOT=1 image build)
+hostonly="no"
+add_dracutmodules+=" livenet dmsquash-live overlayfs network base "
+add_drivers+=" overlay squashfs loop "
+install_items+=" /usr/bin/curl "
+compress="zstd"</code></pre>
+  <p>
+    <code>hostonly="no"</code> pulls in the full generic driver set, and the
+    build then <em>checks its own work</em> — it greps the finished initramfs
+    for the RAID and NIC drivers the fleet actually contains
+    (<code>megaraid_sas</code>, <code>mpt3sas</code>, <code>ixgbe</code>,
+    <code>i40e</code>, <code>mlx5_core</code>&hellip;) and warns on anything
+    missing. A driver you forgot is a server that hangs in early boot with
+    no OS to debug from; a warning at build time costs nothing.
+  </p>
+
+  <h2>Building the artifacts without booting the image</h2>
+  <p>
+    The deploy server turns a sealed golden qcow2 into the three files iPXE
+    references — <code>vmlinuz</code>, <code>initrd.img</code>,
+    <code>root.squashfs</code> — without ever booting the image.
+    <code>build-squashfs.sh</code> uses libguestfs to mount the qcow2
+    read-only, copies the newest kernel and initramfs out of
+    <code>/boot</code>, and squashes the rest:
+  </p>
+  <pre><code>mksquashfs "$MNT" "$OUT/root.squashfs" \
+  -comp zstd -Xcompression-level 15 -noappend -no-xattrs \
+  -e boot/vmlinuz* -e boot/initrd* -e boot/initramfs* \
+  -e proc -e sys -e dev -e run -e tmp</code></pre>
+  <p>
+    Before it squashes anything, though, it verifies the initramfs it just
+    extracted actually contains the livenet modules:
+  </p>
+  <pre><code>for want in livenet dmsquash-live overlayfs; do
+  lsinitrd "$OUT/initrd.img" | grep -qi "$want" || MISSING="$MISSING $want"
+done
+[ -z "$MISSING" ] || { echo "FATAL: initramfs lacks:$MISSING"; exit 1; }</code></pre>
+  <p>
+    This is my favorite kind of check: it catches the "built the golden
+    image but forgot <code>RAMBOOT=1</code>" mistake as a failed build on
+    the deploy server instead of a rack of servers hanging in early boot.
+    Fail the build, not the fleet. The script finishes by writing
+    <code>SHA256SUMS</code> and printing the RAM-floor arithmetic — squashfs
+    size &times; 2 plus headroom — so you know immediately whether the
+    smallest boxes can still swallow the new image.
+  </p>
+
+  <h2>The symlink is the deployment system</h2>
+  <p>
+    Artifacts land in a versioned directory, and one symlink decides what
+    the fleet runs:
+  </p>
+  <pre><code>/srv/pxe/images/
+├── v1-2026-07-06/   vmlinuz  initrd.img  root.squashfs  SHA256SUMS
+├── v2-2026-07-20/   ...
+└── current -&gt; v2-2026-07-20</code></pre>
+  <p>
+    <code>boot.ipxe</code> only ever references
+    <code>images/current/&hellip;</code>. Promoting a new image is
+    <code>ln -sfn</code>; rolling back is the same command pointed at the
+    old directory. Every node that boots gets exactly one image, whole — a
+    box either booted v1 or v2, and "partially upgraded" isn't a state that
+    can exist, by construction rather than by promise. The build script
+    stages new versions without promoting by default; you point one node at
+    the staged directory from the iPXE shell, verify it, and <em>then</em>
+    move the symlink for everyone. That two-command deploy-and-rollback
+    story is, honestly, the operational feature that sold me on the whole
+    architecture.
+  </p>
+
+  <h2>Serving a boot storm</h2>
+  <p>
+    The heavy transfer is plain nginx doing what nginx does at breakfast:
+  </p>
+  <pre><code>root /srv/pxe;
+
+sendfile on;
+tcp_nopush on;
+output_buffers 2 1m;
+
+location / {
+    add_header Accept-Ranges bytes;   # iPXE + dracut can resume
+}</code></pre>
+  <p>
+    Big sequential reads of a static file, with range support so an
+    interrupted fetch resumes instead of restarting a two-gigabyte download.
+    Note what's absent: multicast. That's a disk-imaging trick from the
+    FOG/Ghost era; livenet is unicast HTTP, and a 10&nbsp;GbE NIC on the
+    deploy server handles dozens of simultaneous boots before it breaks a
+    sweat. If the fleet outgrows that, the fixes are config-only — stagger
+    power-on through IPMI, or drop a tiny nginx <code>proxy_cache</code> in
+    each rack and point that rack's boot base at it.
+  </p>
+  <p>
+    And the dependency question from the top of the post: the PXE server
+    only matters <em>at boot</em>. Once <code>rd.live.ram=1</code> has done
+    its copy, a running node has no relationship with the deploy server at
+    all. If nginx catches fire, every running box keeps running; the blast
+    radius is "nodes that reboot during the outage boot slowly or wait" —
+    the same graceful failure shape as the keytab vault, and that's not a
+    coincidence, it's the design rule.
+  </p>
+
+  <h2>Where the pipeline hands off</h2>
+  <p>
+    Seen from the server room floor, the whole conversation looks like this:
+  </p>
+  <div class="diagram">node                              deploy server
+─ power on, firmware PXE ROM ─
+DHCPDISCOVER (broadcast)  &rarr;  corporate DHCP  &rarr; "your IP is 10.10.20.41"
+                          &rarr;  dnsmasq (proxy) &rarr; "boot file: undionly.kpxe"
+                                (option 93: BIOS &rarr; undionly.kpxe, UEFI &rarr; ipxe.efi)
+TFTP GET undionly.kpxe    &rarr;  dnsmasq TFTP    (tiny — the only TFTP transfer)
+─ now running iPXE ─
+DHCP again, user-class iPXE &rarr; dnsmasq        &rarr; "chain http://deploy/boot.ipxe"
+HTTP GET /boot.ipxe            &rarr;  nginx
+HTTP GET /images/current/vmlinuz + initrd.img  &rarr;  nginx
+─ kernel boots, dracut initramfs brings up DHCP ─
+HTTP GET /images/current/root.squashfs  &rarr;  nginx   (copied fully to RAM)
+─ tmpfs OverlayFS over squashfs root &rarr; systemd ─
+keytab-fetch.service &rarr; Infisical vault &rarr; hostname + krb5.keytab &rarr; SSSD</div>
+  <p>
+    That last line is where this post ends and the other two begin: systemd
+    starts, the box still thinks it's <code>localhost</code>, and the
+    <a href="inside-the-keytab-vault-infisical.html">keytab-fetch service</a>
+    asks the vault who it is by MAC address, installs the keytab into tmpfs,
+    and lets SSSD bring Active Directory logins up. Reboot, and every layer
+    of this stack rebuilds itself from scratch, identically.
+  </p>
+
+  <h2>Sharp edges</h2>
+  <p>
+    Four things bit me or nearly did. <strong>ProxyDHCP is a broadcast
+    trick</strong>, so dnsmasq has to sit in the same L2 domain as the nodes
+    (or you get into <code>dhcp-relay</code>); the symptom is a PXE ROM that
+    gets an IP but no boot file, and <code>tcpdump port 4011</code> on the
+    deploy server settles the question fast. <strong>A hang at "waiting for
+    network" inside the initramfs</strong> is almost always a missing NIC
+    driver or firmware blob — <code>lsinitrd | grep</code> before blaming
+    the switch. <strong>Small-RAM nodes can fill the tmpfs overlay</strong>
+    under write-heavy load; journald in the image is already volatile and
+    capped at 64&nbsp;MB, which turned out to be load-bearing rather than
+    tidy. And <strong>Secure Boot bounces UEFI boxes straight back to the
+    PXE menu</strong>, because stock iPXE binaries aren't signed — I turned
+    it off for the POC and wrote down the grown-up path (a signed shim +
+    GRUB chain) for whenever this graduates.
+  </p>
+
+  <hr>
+  <p>
+    Everything quoted here is a real file in
+    <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc"><code>/poc/stateless-sssd-poc</code></a>
+    — start with
+    <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc/08-pxe-ramboot"><code>08-pxe-ramboot/</code></a>,
+    whose README has the full comparison table and failure-mode notes, and
+    <code>pxe-server-setup.sh</code> will stand up the serving stack on a
+    spare box in one run. If your fleet PXE-boots a different way — kexec
+    tricks, signed shims, per-rack caches at real scale — I want to hear
+    about it.
+  </p>
+
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <span>Thanks for reading. This came out of a working proof-of-concept — go break it and tell me what I missed.</span>
+    <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+      <span>Source</span>
+    </a>
+  </div>
+</footer>
+
+</body>
+</html>

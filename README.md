@@ -16,6 +16,20 @@ poc/          — source for proof-of-concept work referenced in posts
 
 ## Posts
 
+- [The Second Boot Is the Real Test](posts/second-boot-is-the-real-test.html)
+  — why "it booted" is the least interesting fact about a boot: the
+  verification script behind the POC, the statelessness canary that can't
+  pass on the run that plants it, and acceptance as two consecutive clean
+  runs across a reboot.
+- [Streaming an OS into RAM: The PXE Boot Pipeline](posts/pxe-ram-boot-pipeline.html)
+  — the boot path from power button to login prompt: dnsmasq proxyDHCP
+  coexisting with corporate DHCP, the single fleet-wide iPXE script, dracut
+  livenet copying a squashfs into RAM, and the versioned-image `current`
+  symlink that makes deploy and rollback one command.
+- [Inside the Keytab Vault: Infisical as a Boot-Time Keystore](posts/inside-the-keytab-vault-infisical.html)
+  — deep dive on the keystore behind the POC: the Infisical compose stack,
+  the hostname/MAC-aliased secret layout, the staging and boot-time fetch
+  flows, and the security model of handing keytabs to stateless hardware.
 - [The Keytab Vault: Diskless Bare-Metal Linux with AD Auth via SSSD](posts/stateless-bare-metal-linux-sssd.html)
   — writeup of the POC in [`poc/stateless-sssd-poc`](poc/stateless-sssd-poc),
   a PXE RAM-boot architecture for stateless bare-metal Linux fleets

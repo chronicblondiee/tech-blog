@@ -32,6 +32,42 @@
     <p>I write up the infrastructure experiments I probably spent too long on — Linux, bare metal, and the occasional bad idea that turned out to work.</p>
   </div>
 
+  <a class="post-list-item" href="posts/second-boot-is-the-real-test.html">
+    <h2>The Second Boot Is the Real Test</h2>
+    <div class="post-meta">July 2026 &middot; infra &middot; testing &middot; linux</div>
+    <p class="excerpt">
+      Every failure I actually feared — state leaking to disk, a keytab that
+      won't re-fetch, a duplicate AD object — is invisible the first time a
+      box boots. So the POC's verification script is a two-act play with a
+      reboot for an intermission, starring a canary file whose only job is
+      to be dead on arrival.
+    </p>
+  </a>
+
+  <a class="post-list-item" href="posts/pxe-ram-boot-pipeline.html">
+    <h2>Streaming an OS into RAM: The PXE Boot Pipeline</h2>
+    <div class="post-meta">July 2026 &middot; infra &middot; linux &middot; pxe</div>
+    <p class="excerpt">
+      The boot path at full resolution: a proxyDHCP server that supplements
+      the corporate one instead of fighting it, a thirty-line iPXE script
+      shared by every node, dracut streaming a squashfs straight into RAM,
+      and a fleet-wide deploy-and-rollback system that is exactly one
+      symlink.
+    </p>
+  </a>
+
+  <a class="post-list-item" href="posts/inside-the-keytab-vault-infisical.html">
+    <h2>Inside the Keytab Vault: Infisical as a Boot-Time Keystore</h2>
+    <div class="post-meta">July 2026 &middot; infra &middot; secrets &middot; infisical</div>
+    <p class="excerpt">
+      The first post waved at "a secrets vault" and moved on. This one opens
+      the box: how Infisical stores base64 keytabs keyed by hostname and NIC
+      MAC, the two-identity split that keeps write access out of the golden
+      image, and an honest accounting of what a shared read-only fleet
+      credential does — and doesn't — protect against.
+    </p>
+  </a>
+
   <a class="post-list-item" href="posts/stateless-bare-metal-linux-sssd.html">
     <h2>The Keytab Vault: Diskless Bare-Metal Linux with AD Auth via SSSD</h2>
     <div class="post-meta">July 2026 &middot; infra &middot; linux &middot; active-directory</div>

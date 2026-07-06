@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inside the Keytab Vault: Infisical as a Boot-Time Keystore</title>
+<meta name="description" content="A deep dive on the Infisical keystore behind my stateless bare-metal Linux POC — how machine keytabs get in once, how diskless hosts get them back out at every boot, and the threat model I knowingly accepted.">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+<meta property="og:title" content="Inside the Keytab Vault: Infisical as a Boot-Time Keystore">
+<meta property="og:description" content="A deep dive on the Infisical keystore behind my stateless bare-metal Linux POC — how machine keytabs get in once, how diskless hosts get them back out at every boot, and the threat model I knowingly accepted.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://chronicblondiee.github.io/tech-blog/posts/inside-the-keytab-vault-infisical.html">
+<meta name="twitter:card" content="summary">
+<link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="../index.html"><span class="logo-mark">c</span>chronicblondiee<span class="dot">.</span>tech</a>
+    <nav class="site">
+      <a href="../index.html">Posts</a>
+      <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc">Source</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <a class="back-link" href="../index.html"><span class="arrow">&larr;</span><span>All posts</span></a>
+
+  <span class="tag">infra</span><span class="tag">secrets</span><span class="tag">infisical</span>
+
+  <h1>Inside the Keytab Vault: Infisical as a Boot-Time Keystore</h1>
+  <div class="post-meta">July 2026 &middot; POC deep dive &middot; full source in <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc"><code>/poc</code></a></div>
+
+  <p class="lede">
+    In <a href="stateless-bare-metal-linux-sssd.html">the last post</a> I
+    described diskless bare-metal hosts that fetch their Kerberos keytab from
+    a secrets vault on every boot — and then gave the vault itself, the thing
+    the whole design leans on, about two paragraphs. This is the missing
+    half: what that keystore actually is, how a keytab gets in exactly once,
+    how anonymous hardware gets it back out at every boot, and the parts of
+    the security model I would tighten before letting any of this near
+    production.
+  </p>
+
+  <h2>Why Infisical and not Vault</h2>
+  <p>
+    The word "vault" primes everyone for HashiCorp Vault, so let me get this
+    out of the way: the keystore is
+    <a href="https://infisical.com">Infisical</a> — an open-source secrets
+    manager that self-hosts as a small Docker Compose stack. No HCL policies,
+    no Shamir key shares, no unseal ceremony. It's a Node app in front of
+    Postgres with a web UI and an HTTP API, which sounds unglamorous until
+    you remember what this component actually has to do: hand one base64
+    blob to a shell script at boot. I didn't need dynamic database
+    credentials or a PKI engine. I needed a key-value store with real access
+    control and an auth method a <code>curl</code> one-liner could drive.
+  </p>
+  <p>
+    The honest trade-off: Vault and OpenBao have a much richer
+    identity-attestation story — cert auth, response wrapping, TPM plugins.
+    Infisical's <em>Universal Auth</em> is a client-ID/client-secret pair,
+    morally equivalent to Vault's AppRole and nothing more. That constraint
+    shapes the entire threat model further down, so hold that thought.
+  </p>
+
+  <h2>The stack: four containers, one stateful volume</h2>
+  <p>
+    Everything runs from one compose file
+    (<code>02-infisical/docker-compose.yml</code> in the POC). Trimmed to
+    what matters:
+  </p>
+  <pre><code>services:
+  db:
+    image: postgres:16-alpine
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no
+
+  db-migration:
+    image: infisical/infisical:latest-postgres
+    command: npm run migration:latest
+
+  backend:
+    image: infisical/infisical:latest-postgres
+    depends_on:
+      db-migration:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+
+volumes:
+  pg_data:</code></pre>
+  <ul>
+    <li><strong>Postgres is the only thing that holds state.</strong> Secrets sit encrypted in the <code>pg_data</code> volume, keyed by an <code>ENCRYPTION_KEY</code> the backend reads from <code>.env</code> at startup. Back up that volume and you've backed up the vault; lose the key and the backup is confetti.</li>
+    <li><strong>Redis is deliberately amnesiac.</strong> <code>--save "" --appendonly no</code> — it's cache and queue only, so there is no second place secret material could quietly persist.</li>
+    <li><strong>The migration container is a one-shot gate.</strong> The backend refuses to start until migrations finish, which keeps upgrades boring: <code>docker compose pull</code>, <code>up -d</code>, done.</li>
+    <li><strong>It's plain HTTP on :8080.</strong> The compose file says so out loud — "Put TLS termination (nginx/caddy) in front for prod." Remember this one for the threat model.</li>
+  </ul>
+
+  <h2>The data model: one flat folder, aliased by everything</h2>
+  <p>
+    Inside Infisical there's a single project (<code>stateless-keytabs</code>),
+    the default <code>prod</code> environment, and one folder:
+    <code>/keytabs</code>. A keytab is a binary file and Infisical stores
+    strings, so every value is <code>base64 -w0</code> output — nothing
+    clever. What <em>is</em> a little clever is the key naming. Each physical
+    server contributes a small constellation of flat key-value pairs:
+  </p>
+  <div class="diagram">stage-keytabs.sh  (admin host &middot; once per server)
+  adcli join &rarr; web01.keytab &rarr; base64 &rarr; POST /api/v3/secrets/raw/&hellip;
+  auth: keytab-stager &middot; Developer (rw on /keytabs) &middot; revoked after staging
+        &darr;
+Infisical  &middot;  project stateless-keytabs &middot; env prod &middot; path /keytabs
+  KEYTAB_WEB01              = &lt;base64 keytab&gt;
+  KEYTAB_MAC_A4BF015E22C1   = same keytab        (one alias per cabled NIC)
+  HOSTNAME_MAC_A4BF015E22C1 = web01
+  state: Postgres (pg_data) only &middot; Redis is deliberately amnesiac
+        &darr;
+fetch-keytab.sh  (every diskless node &middot; every boot)
+  auth: baremetal-boot &middot; Viewer (ro on /keytabs) &middot; baked into the image
+  try KEYTAB_&lt;HOSTNAME&gt; &rarr; else KEYTAB_MAC_&lt;MAC&gt; for every physical NIC
+  &rarr; /etc/krb5.keytab (root:root 0600, tmpfs) &rarr; kinit check &rarr; sssd starts</div>
+  <p>
+    The MAC aliases are the part I'm fondest of. A multi-homed server fresh
+    off the pallet doesn't know its own hostname yet, and whichever NIC
+    someone happened to cable is the one that comes up. So every NIC's MAC
+    becomes a key, all pointing at the same keytab, plus a
+    <code>HOSTNAME_MAC_*</code> entry so the vault can tell the box what it's
+    called. Identity flows <em>from the vault to the host</em>, never the
+    other way: hostname assignment is a keystore lookup, and DHCP option 12
+    is explicitly not trusted (NetworkManager runs with
+    <code>hostname-mode=none</code> so the network can't rename the box out
+    from under its own keytab).
+  </p>
+
+  <h2>Two identities, and only one goes in the image</h2>
+  <p>
+    Infisical machine identities are the moral equivalent of service
+    accounts, and the design uses exactly two:
+  </p>
+  <ul>
+    <li><strong><code>keytab-stager</code> — Developer role, read/write on <code>/keytabs</code>.</strong> Lives only on the admin host that runs the staging script. The runbook's instruction is blunt: revoke or rotate its client secret the moment staging is done.</li>
+    <li><strong><code>baremetal-boot</code> — Viewer role, read-only on <code>/keytabs</code>.</strong> This is the identity baked into the golden image as <code>/etc/keytab-fetch.env</code> (root-owned, mode 0600): a client ID and client secret, plus the vault URL and project ID. Its access tokens are capped at a 300-second TTL, and the client secret can optionally be pinned to a trusted IP range — the bare-metal subnet — which is the cheapest hardening win in the whole design.</li>
+  </ul>
+  <p>
+    The split means the golden image never carries anything that can create
+    AD objects or write vault secrets. The worst the baked-in identity can
+    do is <em>read</em> keytabs — which is still plenty, and we'll get to
+    exactly how much in a minute.
+  </p>
+
+  <h2>Keytabs in: join once, upload, shred</h2>
+  <p>
+    The producer side is one script, <code>stage-keytabs.sh</code>, run from
+    an admin box with line of sight to both AD and Infisical. It walks a
+    CSV of hostnames and MACs, and for each host the core move is:
+  </p>
+  <pre><code>printf '%s' "$AD_JOIN_PASS" | adcli join "$AD_DOMAIN" \
+      --login-user="$AD_JOIN_USER" \
+      --stdin-password \
+      --computer-name="$SHORT" \
+      --host-fqdn="${SHORT}.${AD_DOMAIN}" \
+      --domain-ou="$AD_OU" \
+      --host-keytab="$KT" \
+      --show-details
+
+B64=$(base64 -w0 "$KT")
+upsert_secret "KEYTAB_$(echo "$SHORT" | tr 'a-z-' 'A-Z_')" "$B64"</code></pre>
+  <ul>
+    <li><strong><code>adcli join</code> does both halves in one step</strong> — it creates the AD computer object in the right OU <em>and</em> emits the keytab. No <code>kinit</code>/<code>ktutil</code> juggling.</li>
+    <li><strong>The staging box never joins anything.</strong> <code>--computer-name</code> targets the remote host and <code>--host-keytab</code> points at a per-host file, so the admin host's own identity is untouched. It's a keytab factory, not a domain member doing favors.</li>
+    <li><strong>Uploads are upserts.</strong> The script tries <code>POST</code> and falls back to <code>PATCH</code> if the key exists — so re-running it for a host resets the AD machine password, bumps the key version, and overwrites the vault copy in one motion. That's not just idempotency; that's the recovery procedure, and it matters later.</li>
+    <li><strong>Local copies die at the end.</strong> The script's parting words are <code>shred -u ./keytabs/*.keytab</code>. The vault copy is the only durable one, on purpose.</li>
+  </ul>
+
+  <h2>Keytabs out: the boot-time fetch</h2>
+  <p>
+    The consumer side is a systemd oneshot wired in front of SSSD. The unit
+    is short enough to quote almost whole:
+  </p>
+  <pre><code>[Unit]
+Wants=network-online.target chrony.service chronyd.service
+After=network-online.target time-sync.target
+Before=sssd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fetch-keytab.sh
+RemainAfterExit=yes
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target
+RequiredBy=sssd.service</code></pre>
+  <ul>
+    <li><strong>The ordering is the whole point.</strong> After the network <em>and</em> time sync (Kerberos only tolerates about five minutes of clock skew), strictly before SSSD, and <code>RequiredBy=sssd.service</code> so SSSD can't wander off and start without the fetch at least being attempted.</li>
+    <li><strong><code>Type=oneshot</code> means systemd won't retry it</strong>, so the retry is hand-rolled inside the script: a 30&times;3-second reachability loop — about ninety seconds of patience for the vault to answer — before anything else happens.</li>
+    <li><strong>Total failure doesn't brick the box.</strong> If the vault never answers, the unit fails but boot continues. AD logins are simply unavailable until a reboot fetches successfully; local and console accounts keep working so you can actually debug the thing.</li>
+  </ul>
+  <p>
+    When the fetch does succeed, the installation is deliberately paranoid
+    and deliberately forgiving, in that order:
+  </p>
+  <pre><code>umask 077
+printf '%s' "$B64" | base64 -d &gt; "${KEYTAB}.tmp"
+mv "${KEYTAB}.tmp" "$KEYTAB"
+chown root:root "$KEYTAB"; chmod 600 "$KEYTAB"
+
+PRINC="$(echo "$HOSTNAME_SHORT" | tr 'a-z' 'A-Z')\$@${AD_REALM}"
+KRB5CCNAME=MEMORY: kinit -kt "$KEYTAB" "$PRINC"</code></pre>
+  <p>
+    On a RAM-booted node <code>/etc</code> lives in tmpfs, so the keytab
+    never touches a disk — power off and it's gone. The final
+    <code>kinit</code> is advisory by design: a missing vault secret is
+    fatal, but a failed <code>kinit</code> only logs a warning and lets SSSD
+    start anyway. A flaky KDC or a DNS hiccup at second 40 of boot shouldn't
+    take AD auth down for the whole uptime; a genuinely bad keytab gets
+    caught loudly by the verification pass instead.
+  </p>
+
+  <h2>The honest threat model</h2>
+  <p>
+    Here's the part where I stop being proud of it.
+  </p>
+  <ul>
+    <li><strong>One shared read-only credential for the whole fleet, baked into the image.</strong> A stateless host has nowhere private to keep a per-host secret — that's practically the definition — so every node authenticates to the vault as the same <code>baremetal-boot</code> identity. Anyone who obtains the golden image has the client secret.</li>
+    <li><strong>Any node can read any node's keytab.</strong> The Viewer role covers the entire flat <code>/keytabs</code> folder, and the key names are guessable by construction — they're just hostnames and MACs. Compromise one booted box and you can enumerate the fleet's machine identities.</li>
+    <li><strong>It all rides plain HTTP in the lab.</strong> The client secret and the base64 keytab both cross the wire unencrypted on port 8080, at every single boot.</li>
+  </ul>
+  <p>
+    The hardening path is written down in the POC's implementation guide,
+    and none of it changes the shape of the design — which is exactly why I
+    let myself cut these corners. TLS is a one-liner caddy front. The
+    trusted-IP range on the client secret confines credential theft to
+    machines already on the bare-metal subnet. Per-host machine identities
+    with per-host path scoping close the "read your neighbor's keytab" hole,
+    at the cost of the provisioning workflow having to place a distinct
+    secret on each stateless box — which circles back to TPM or
+    hardware-serial attestation as the only really satisfying answer for
+    hardware that owns nothing at power-on. The 300-second token TTL helps
+    less than it looks: captured tokens age out fast, but the client secret
+    is the long-lived thing, and it lives in a squashfs anyone can download
+    from the image server.
+  </p>
+
+  <h2>The KVNO trap, seen from the vault's side</h2>
+  <p>
+    The first post covered
+    <code>ad_maximum_machine_account_password_age = 0</code> as the SSSD
+    line that will bite you. From the keystore's side, here's <em>why</em>
+    it's load-bearing: the vault holds a snapshot. A keytab is frozen at a
+    specific key version number (KVNO), and Active Directory expects machine
+    passwords to rotate every 30 days. If SSSD honors that default, the AD
+    object's KVNO advances, the vault's copy silently goes stale, and every
+    subsequent boot fetches a keytab that fails preauthentication. The
+    config template in the golden image doesn't mince words about it:
+  </p>
+  <pre><code># CRITICAL
+# Stateless hosts must NEVER rotate the machine account password.
+# The keytab in the vault is the single source of truth; rotation would
+# desync the KVNO and break every subsequent boot. 0 = disabled.
+ad_maximum_machine_account_password_age = 0</code></pre>
+  <p>
+    If it does desync — something ran <code>realm join</code> behind your
+    back, or a well-meaning GPO rotated the password — the fix is the
+    staging script itself: re-run it for that one host, and the
+    <code>adcli join</code> resets the password while the upsert pushes the
+    fresh keytab at the new KVNO. And if never rotating machine passwords
+    makes you itch (it should, a little), the rotation job you'd want is
+    just the staging script on a timer. I haven't needed it yet.
+  </p>
+
+  <h2>Running it</h2>
+  <ul>
+    <li><strong>There is no unseal ceremony.</strong> <code>restart: always</code> plus the <code>ENCRYPTION_KEY</code> in <code>.env</code> means a power-cycled vault host comes back serving secrets with zero human intervention. Vault would sit sealed waiting for key shares — the right call for a bank, the wrong call for my garage.</li>
+    <li><strong>Backup is one Postgres volume.</strong> <code>pg_data</code> is the entire vault state. Confession: the POC docs never actually wrote the backup step down. The honest runbook line is a <code>pg_dump</code> on a timer plus a copy of <code>.env</code> somewhere safe — the encryption key and the data are only useful together.</li>
+    <li><strong>The vault only matters at boot.</strong> Running nodes hold their keytab in RAM and never re-fetch mid-uptime, so Infisical downtime affects exactly the nodes that reboot during it. The blast radius of "the keystore is down" is a queue of reboots, not an outage.</li>
+  </ul>
+
+  <hr>
+  <p>
+    The compose file, runbook, staging script, and fetch script quoted here
+    are all real files in
+    <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc"><code>/poc/stateless-sssd-poc</code></a>
+    — start with
+    <a href="https://github.com/chronicblondiee/tech-blog/blob/main/poc/stateless-sssd-poc/02-infisical/setup-infisical.md"><code>02-infisical/setup-infisical.md</code></a>
+    and follow stages 03 and 04. And if you find a hole in the
+    shared-credential story I haven't listed, that's the feedback I most
+    want.
+  </p>
+
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <span>Thanks for reading. This came out of a working proof-of-concept — go break it and tell me what I missed.</span>
+    <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+      <span>Source</span>
+    </a>
+  </div>
+</footer>
+
+</body>
+</html>

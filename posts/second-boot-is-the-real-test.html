@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Second Boot Is the Real Test</title>
+<meta name="description" content="Why I don't trust a machine that has only booted once: the hundred-line verification script behind my stateless fleet POC, the statelessness canary, and why acceptance means two consecutive clean runs across a reboot.">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+<meta property="og:title" content="The Second Boot Is the Real Test">
+<meta property="og:description" content="Why I don't trust a machine that has only booted once: the hundred-line verification script behind my stateless fleet POC, the statelessness canary, and why acceptance means two consecutive clean runs across a reboot.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://chronicblondiee.github.io/tech-blog/posts/second-boot-is-the-real-test.html">
+<meta name="twitter:card" content="summary">
+<link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="../index.html"><span class="logo-mark">c</span>chronicblondiee<span class="dot">.</span>tech</a>
+    <nav class="site">
+      <a href="../index.html">Posts</a>
+      <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc">Source</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <a class="back-link" href="../index.html"><span class="arrow">&larr;</span><span>All posts</span></a>
+
+  <span class="tag">infra</span><span class="tag">testing</span><span class="tag">linux</span>
+
+  <h1>The Second Boot Is the Real Test</h1>
+  <div class="post-meta">July 2026 &middot; POC writeup &middot; full source in <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc"><code>/poc</code></a></div>
+
+  <p class="lede">
+    Three posts of architecture — <a href="stateless-bare-metal-linux-sssd.html">the
+    design</a>, <a href="inside-the-keytab-vault-infisical.html">the vault</a>,
+    <a href="pxe-ram-boot-pipeline.html">the boot pipeline</a> — all making
+    one claim: nothing persists. This last one is about how I decide whether
+    that claim is true, and why the answer is never visible on the first
+    boot. "It booted" turns out to be the least interesting fact about a
+    boot.
+  </p>
+
+  <h2>The lies a first boot tells</h2>
+  <p>
+    Every failure mode I actually feared in this project is invisible on
+    boot one. A box quietly leaking state onto a local disk looks
+    <em>identical</em> to a stateless one, right up until the boot where the
+    leak matters. A keytab that fetched fine today says nothing about
+    whether the fetch path works every time or worked once. And the
+    worst-case failure — something in the image running
+    <code>realm join</code> behind my back and minting a duplicate AD
+    computer object — literally cannot show up on the first boot, because
+    the object count only moves on the boots after it.
+  </p>
+  <p>
+    The property I built is an <em>invariant across reboots</em>, and you
+    can't verify an invariant with one sample. You need at least two,
+    separated by the exact state transition that could break it. So the POC
+    ships a verification script, and the script is designed around that
+    reboot.
+  </p>
+
+  <h2>Eight checks, each hunting a specific lie</h2>
+  <p>
+    <code>verify-poc.sh</code> is about a hundred lines and runs as root on
+    a deployed node. It isn't a smoke test — every check exists to catch a
+    specific way the system could be lying to me. The overlay check catches
+    a root filesystem that would silently persist writes. The time-sync
+    check exists because Kerberos tolerates about five minutes of clock
+    skew, and a failed <code>kinit</code> two checks later is unreadable
+    without it. My favorite of the early ones is this pair:
+  </p>
+  <pre><code>if grep -q 'root=live:' /proc/cmdline; then
+  ok "booted via livenet: $(grep -o 'root=live:[^ ]*' /proc/cmdline)"
+  grep -q 'rd.live.ram=1' /proc/cmdline \
+    &amp;&amp; ok "image fully copied to RAM (rd.live.ram=1)" \
+    || bad "rd.live.ram=1 missing — node keeps a network dependency on the PXE server"
+fi</code></pre>
+  <p>
+    That second line catches the subtlest failure in the whole design: a
+    node that boots perfectly, runs perfectly, and has quietly kept a
+    runtime dependency on the PXE server because the image never finished
+    copying to RAM. Nothing about the running system looks wrong. The lie
+    only surfaces the day the deploy server goes down and a "stateless"
+    node hangs with it.
+  </p>
+  <p>
+    The identity checks climb a ladder of increasing proof. The keytab
+    exists — fine. The keytab contains <em>this host's</em> principal —
+    better, because "fetched a keytab" and "fetched the right keytab" are
+    different claims when the vault is keyed by hostname <em>and</em> MAC.
+    Then the real one: authenticate with it against the KDC.
+  </p>
+  <pre><code>KRB5CCNAME=MEMORY: kinit -kt /etc/krb5.keytab \
+  "$(echo "$HOSTN" | tr 'a-z' 'A-Z')\$@${REALM}"</code></pre>
+  <p>
+    A file on disk proves nothing; a ticket from the domain controller
+    proves the machine account, the KVNO, and the clock all agree. Above
+    that sit the user-facing layers — SSSD's domain reporting Online, an
+    actual AD user resolving through <code>id</code> — and then the check
+    that guards against my nightmare: <code>adcli show-computer</code>, run
+    <em>using the node's own keytab</em>, confirming the computer object
+    exists and there's exactly one of it. One design rule of the whole
+    architecture is that only the staging script ever touches AD; this is
+    the line that would catch a violation.
+  </p>
+  <p>
+    A small thing I'd defend in review: the script counts failures instead
+    of dying on the first one — report first, gate at the end with
+    <code>[ "$FAIL" -eq 0 ]</code>. On hardware, the second and third
+    failures are usually the ones that tell you what the first one meant.
+  </p>
+
+  <h2>The canary</h2>
+  <p>
+    Check eight is the reason this post exists. Quoted nearly whole:
+  </p>
+  <pre><code>echo "== 8. Statelessness canary =="
+if [ -f /root/.poc-canary ]; then
+  bad "canary from previous boot SURVIVED — root is NOT stateless"
+  rm -f /root/.poc-canary
+else
+  touch /root/.poc-canary
+  info "canary planted at /root/.poc-canary — reboot and re-run; step 8 must not FAIL"
+fi</code></pre>
+  <p>
+    This check <em>cannot pass on the run that plants it</em>. It writes a
+    file into the one place files aren't supposed to survive, and its only
+    job is to be dead on arrival next boot. Which means the script's
+    verdict is only meaningful the second time you run it — by design, the
+    whole thing is a two-act play with a reboot for an intermission. And
+    the canary is the check that keeps the other seven honest: if that file
+    survives a reboot, then root isn't stateless, the keytab didn't come
+    from the vault this boot, and every green <code>PASS</code> above it is
+    describing a machine I only think I have.
+  </p>
+  <div class="diagram">boot 1
+  stream image &rarr; RAM &rarr; fetch keytab &rarr; verify-poc.sh: all PASS
+  plant canary: /root/.poc-canary
+  proves: the happy path works — once
+        &darr;  reboot (entire OS discarded from RAM)
+boot 2
+  stream image &rarr; RAM &rarr; fetch keytab &rarr; verify-poc.sh again
+  canary gone?        &rarr; root really is stateless
+  keytab re-fetched?  &rarr; the vault path works every boot, not one boot
+  AD objects still 1? &rarr; nothing joined behind my back
+  proves: the invariant</div>
+
+  <h2>Acceptance is a sentence, not a dashboard</h2>
+  <p>
+    The script ends by printing its own pass criterion, and I've grown
+    attached to having it there, where the person staring at a serial
+    console at 2am will actually read it:
+  </p>
+  <pre><code>RESULT: 11 passed, 0 failed
+POC acceptance = two consecutive clean runs across a reboot with FAIL=0.</code></pre>
+  <p>
+    The implementation guide tightens it further: the AD object count for a
+    host stays at exactly one across <em>at least three</em> reboots, and
+    before any fleet rollout the script runs on one unit of <em>each</em>
+    hardware model (plus a <code>dmesg -l err</code> sweep), because a
+    fleet of mismatched hardware fails per-model, not per-fleet. Gaps get
+    fixed by adding a driver to the single image — never by forking a
+    per-model one.
+  </p>
+
+  <h2>The general rule</h2>
+  <p>
+    None of this is specific to PXE or Kerberos. The pattern is: when a
+    system claims a property, don't test the demo — write the check that
+    would catch the system <em>lying</em> about the property, and put the
+    state transition that could break it inside the acceptance criterion.
+    "Stateless" is a claim about reboots, so the reboot goes in the test.
+    "Highly available" is a claim about failures, so the failure goes in
+    the test. A first boot, a first request, a first failover — the first
+    anything mostly measures whether you wrote a demo. The second one
+    measures whether you built what you said you built.
+  </p>
+
+  <hr>
+  <p>
+    The script is
+    <a href="https://github.com/chronicblondiee/tech-blog/blob/main/poc/stateless-sssd-poc/07-verification/verify-poc.sh"><code>07-verification/verify-poc.sh</code></a>
+    in the POC repo — a hundred lines, no dependencies beyond what the
+    image already carries. Steal the canary trick; it's the cheapest
+    honest test I've ever written. And that wraps this series — if you've
+    read all four and still think the design holds, go run it twice and
+    prove me wrong on the second one.
+  </p>
+
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <span>Thanks for reading. This came out of a working proof-of-concept — go break it and tell me what I missed.</span>
+    <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+      <span>Source</span>
+    </a>
+  </div>
+</footer>
+
+</body>
+</html>
