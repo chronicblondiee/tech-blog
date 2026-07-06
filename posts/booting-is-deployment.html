@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Booting Is Deployment: MAAS, FOG, and the Problem That Disappeared</title>
+<meta name="description" content="I wrote complete working runbooks for two deployment systems, then benched both — not because they lost a bake-off, but because RAM-boot deleted the problem they solve. Plus the two roads I might still take.">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+<meta property="og:title" content="Booting Is Deployment: MAAS, FOG, and the Problem That Disappeared">
+<meta property="og:description" content="I wrote complete working runbooks for two deployment systems, then benched both — not because they lost a bake-off, but because RAM-boot deleted the problem they solve. Plus the two roads I might still take.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://chronicblondiee.github.io/tech-blog/posts/booting-is-deployment.html">
+<meta name="twitter:card" content="summary">
+<link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="../index.html"><span class="logo-mark">c</span>chronicblondiee<span class="dot">.</span>tech</a>
+    <nav class="site">
+      <a href="../index.html">Posts</a>
+      <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc">Source</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <a class="back-link" href="../index.html"><span class="arrow">&larr;</span><span>All posts</span></a>
+
+  <span class="tag">infra</span><span class="tag">deployment</span><span class="tag">linux</span>
+
+  <h1>Booting Is Deployment: MAAS, FOG, and the Problem That Disappeared</h1>
+  <div class="post-meta">July 2026 &middot; POC writeup &middot; full source in <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc"><code>/poc</code></a></div>
+
+  <p class="lede">
+    Somewhere in the POC repo are two complete, working runbooks for
+    deployment systems I don't use. I evaluated Canonical MAAS and FOG
+    Project properly — installed them, imaged real machines, wrote down the
+    gotchas — and then benched both. Not because either lost a bake-off.
+    Because <a href="pxe-ram-boot-pipeline.html">the RAM-boot pipeline</a>
+    deleted the problem they solve. The most satisfying tooling decision
+    I've made all year wasn't picking a tool; it was noticing I could stop
+    needing one.
+  </p>
+
+  <h2>The problem as I originally framed it</h2>
+  <p>
+    The plan, before RAM-boot was the plan, went: build one golden disk
+    image, clone it onto N mismatched physical boxes, then specialize each
+    clone — hostname, identity, the grub argument that turns on the
+    stateless overlay. Cloning disks and specializing clones is precisely
+    the job MAAS and FOG exist for, so I evaluated both. Both worked. That's
+    worth saying clearly before I explain why neither is running: these are
+    good tools, and the runbooks in <code>06-deployment/</code> got real
+    machines from powered-off to domain-joined.
+  </p>
+
+  <h2>MAAS: the smooth road</h2>
+  <p>
+    MAAS was the pleasant surprise. Three things lined up almost eerily
+    well with the architecture. It knows every machine by MAC and lets you
+    name machines — which maps one-to-one onto the <code>hosts.csv</code>
+    that drives keytab staging. It injects cloud-init user-data natively,
+    so the specialization file in the repo just gets pasted into the deploy
+    form. And it will write a completely foreign disk image verbatim:
+  </p>
+  <pre><code>qemu-img convert -O raw golden.qcow2 golden-sssd.img
+gzip golden-sssd.img
+maas $PROFILE boot-resources create \
+  name='custom/suse-sssd-stateless' \
+  architecture='amd64/generic' \
+  filetype='ddgz' \
+  content@=golden-sssd.img.gz</code></pre>
+  <p>
+    <code>ddgz</code> means "gunzip this and dd it onto the disk" — MAAS
+    (an Ubuntu-flavored tool) neither knows nor cares that there's a SUSE
+    system inside. And the lifecycle story was genuinely elegant: release a
+    machine, redeploy it with a new image version, and the AD computer
+    object and the vaulted keytab are untouched — the node reclaims its
+    identity on first boot with no re-join. My runbook calls that "the core
+    payoff of the architecture," and it's the sentence that turned out to
+    matter most, though not the way I expected. Two gotchas worth
+    preserving: if MAAS runs DNS for the subnet it needs forwarders to the
+    AD domain controllers or SSSD's SRV discovery dies, and the MAC in your
+    CSV had better be the NIC that actually PXE-boots.
+  </p>
+
+  <h2>FOG: the multicast road</h2>
+  <p>
+    FOG's pitch is different: when you need to image many boxes at once,
+    multicast deployment writes them all simultaneously from one stream.
+    The trade-off is that FOG has no native cloud-init, so specialization
+    means a "Snapin" script that runs at first boot. Except — and this is
+    the moment the ground started shifting — while writing that Snapin I
+    realized the minimum viable FOG flow needs <em>zero snapins</em>. A
+    bit-perfect clone boots, and
+    <a href="inside-the-keytab-vault-infisical.html">the vault</a> already
+    handles everything a specialization step would do: the fetch script
+    looks up <code>KEYTAB_MAC_&lt;MAC&gt;</code> when the hostname is
+    generic and sets the hostname from <code>HOSTNAME_MAC_&lt;MAC&gt;</code>.
+    The architecture had quietly absorbed per-node specialization before
+    the deployment tool got a chance to perform it. FOG's own gotchas, for
+    the record: resizable single-disk capture wants a plain ext4 root while
+    SUSE defaults to btrfs; multicast floods your switches unless IGMP
+    snooping is configured; and FOG and MAAS fight over the same DHCP scope
+    options, so it's one deployer per subnet, ever.
+  </p>
+
+  <h2>The realization</h2>
+  <p>
+    Look at what was happening across both evaluations: the specialization
+    section kept shrinking, because vault-assigned identity kept eating it.
+    The deployers were being reduced to exactly one function — writing a
+    disk. Then the RAM-boot decision removed the disk. A deployment system
+    deploys disks; with no disk, there is nothing to deploy, and the
+    remaining "per-node deployment step" is setting PXE-first in the boot
+    order once, at racking. RAM-boot didn't beat MAAS and FOG on features.
+    It dissolved the category they compete in.
+  </p>
+  <div class="diagram">the disk road (MAAS / FOG)
+  capture golden image &rarr; register every node in the deployer
+  &rarr; write each disk (unicast or multicast) &rarr; specialize each clone
+  &rarr; reboot into the overlay &rarr; steady state
+  update or rollback = release + redeploy &middot; per node, per cycle
+
+the RAM road
+  build squashfs from the sealed golden &rarr; publish images/v2-&lt;date&gt;/
+  &rarr; ln -sfn v2-&lt;date&gt; images/current
+  update or rollback = that symlink &middot; whole fleet, next reboot</div>
+  <p>
+    Fleet-wide rollout became <code>ln -sfn</code>. Rollback became the
+    same command pointed backwards. Nothing on the disk road competes with
+    that, because the disk road has to visit every machine and the RAM road
+    doesn't visit anything.
+  </p>
+
+  <h2>Demoted, not rejected</h2>
+  <p>
+    Here's the honest nuance: both runbooks are still in the repo, still
+    working, and deliberately so. They're labeled the fallback path for
+    hardware that can't RAM-boot — not enough memory for a
+    two-and-a-half-gigabyte image plus a working set, or a NIC whose PXE
+    ROM predates hope. And the fallback is cheap to keep precisely because
+    of a design rule from the very first post: the identity flow — vault,
+    keytab fetch, SSSD — is storage-agnostic. A MAAS-deployed node running
+    <code>systemd.volatile=overlay</code> on a real disk executes exactly
+    the same boot-time flow as a diskless one. The deployers were demoted
+    from "the deployment system" to "how the weird hardware gets by," and
+    they handle that role fine.
+  </p>
+
+  <h2>Two roads I might still take</h2>
+  <p>
+    The evaluation notes end with two forks I marked for later rather than
+    no. The first is <strong>openSUSE MicroOS / SLE Micro</strong>, whose
+    transactional read-only btrfs root is a genuinely different
+    statelessness model: instead of total amnesia — my design — it keeps
+    persistent state but makes every change an atomic snapshot you can roll
+    back. That's not a variation on this architecture; it's a competing
+    philosophy, and it deserves its own POC rather than a footnote. The
+    second is <strong>KIWI NG</strong>, SUSE's declarative image builder,
+    which would replace my golden-VM-plus-seal ritual with a described
+    image built from a spec — same <code>rd.live.*</code> boot semantics
+    via its <code>kiwi-live</code> dracut module, and the entire PXE server
+    side (dnsmasq, iPXE, nginx, the versioned <code>current</code> symlink)
+    stays identical. The pattern holds: RAM-boot deleted a problem, and
+    these two are candidates to delete <em>steps</em>. I'll take a deleted
+    step over a new feature most days.
+  </p>
+
+  <hr>
+  <p>
+    Both runbooks live in
+    <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc/06-deployment"><code>06-deployment/</code></a>
+    — <code>maas-deploy.md</code> and <code>fog-deploy.md</code>, complete
+    with the gotchas — and the MicroOS and KIWI notes are in
+    <a href="https://github.com/chronicblondiee/tech-blog/blob/main/poc/stateless-sssd-poc/05-stateless-boot/suse-stateless-notes.md"><code>05-stateless-boot/suse-stateless-notes.md</code></a>.
+    If you're running a fleet where the deployer earns its keep in ways I
+    haven't hit, I'd genuinely like to know what I'm missing.
+  </p>
+
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <span>Thanks for reading. This came out of a working proof-of-concept — go break it and tell me what I missed.</span>
+    <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+      <span>Source</span>
+    </a>
+  </div>
+</footer>
+
+</body>
+</html>

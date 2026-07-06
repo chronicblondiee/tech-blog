@@ -16,6 +16,11 @@ poc/          — source for proof-of-concept work referenced in posts
 
 ## Posts
 
+- [Booting Is Deployment: MAAS, FOG, and the Problem That Disappeared](posts/booting-is-deployment.html)
+  — the deployment systems evaluated for the POC and demoted to the
+  disk-deploy fallback once RAM-boot removed the disk itself, plus the two
+  roads noted for later: MicroOS's transactional root and KIWI NG image
+  builds.
 - [The Second Boot Is the Real Test](posts/second-boot-is-the-real-test.html)
   — why "it booted" is the least interesting fact about a boot: the
   verification script behind the POC, the statelessness canary that can't
