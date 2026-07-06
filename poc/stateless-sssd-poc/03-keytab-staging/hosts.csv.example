@@ -1,0 +1,8 @@
+# hostname,mac_address(es)
+# Short hostname (<=15 chars, NetBIOS limit).
+# VARIED HARDWARE: list ALL onboard/add-in NIC MACs semicolon-separated —
+# the boot script tries every physical NIC, so any cabled port resolves.
+hostname,mac
+bm-node01,AA:BB:CC:00:11:01;AA:BB:CC:00:11:02
+bm-node02,DE:AD:BE:EF:22:01
+bm-node03,DE:AD:BE:EF:33:01;DE:AD:BE:EF:33:02;DE:AD:BE:EF:33:03

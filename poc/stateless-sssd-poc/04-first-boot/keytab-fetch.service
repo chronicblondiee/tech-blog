@@ -1,0 +1,20 @@
+[Unit]
+Description=Fetch AD machine keytab from Infisical before SSSD starts
+Documentation=file:///usr/local/sbin/fetch-keytab.sh
+Wants=network-online.target chrony.service chronyd.service
+After=network-online.target time-sync.target
+Before=sssd.service
+# If the fetch fails, do NOT block boot entirely — sssd will fail auth but the
+# box stays reachable via local/console accounts for debugging.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fetch-keytab.sh
+RemainAfterExit=yes
+TimeoutStartSec=180
+# NOTE: Restart= is not valid for Type=oneshot; network/API retries are
+# implemented inside fetch-keytab.sh (30 x 3s reachability loop).
+
+[Install]
+WantedBy=multi-user.target
+RequiredBy=sssd.service

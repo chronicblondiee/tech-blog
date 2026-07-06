@@ -1,0 +1,30 @@
+#!ipxe
+# /srv/pxe/boot.ipxe — single fleet boot script.
+# Image selection is a symlink on the server (images/current -> vN-date):
+# promote/rollback fleet-wide by repointing the symlink; nodes pick it up on
+# next reboot. No per-node config exists here by design — identity comes from
+# the Infisical vault keyed by NIC MAC after userspace is up.
+
+set base http://@@DEPLOY_FQDN@@/images/current
+
+echo === Stateless SSSD RAM-boot ===
+echo MAC ${net0/mac}  |  image base: ${base}
+
+# dracut livenet: fetch squashfs over HTTP, copy fully to RAM, tmpfs OverlayFS on top
+kernel ${base}/vmlinuz \
+  root=live:${base}/root.squashfs \
+  rd.live.ram=1 \
+  rd.live.overlay.overlayfs=1 \
+  rd.live.dir=/ rd.live.squashimg=root.squashfs \
+  rd.neednet=1 ip=dhcp rd.timeout=120 \
+  console=tty0 console=ttyS0,115200n8 \
+  systemd.hostname=localhost || goto failed
+
+initrd ${base}/initrd.img || goto failed
+boot || goto failed
+
+:failed
+echo Boot failed — retrying DHCP + chain in 10s (Ctrl-B for iPXE shell)
+sleep 10
+dhcp
+chain http://@@DEPLOY_FQDN@@/boot.ipxe

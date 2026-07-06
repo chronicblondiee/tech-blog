@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Keytab Vault: Diskless Bare-Metal Linux with AD Auth via SSSD</title>
+<meta name="description" content="A PXE RAM-boot architecture for stateless bare-metal Linux fleets that authenticate against Active Directory through SSSD, with secrets pulled from Infisical at every boot.">
+<link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="../index.html">chronicblondiee<span>.</span>tech</a>
+    <nav class="site">
+      <a href="../index.html">Posts</a>
+      <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc">Source</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <a class="back-link" href="../index.html">&larr; All posts</a>
+
+  <span class="tag">infra</span><span class="tag">linux</span><span class="tag">active-directory</span>
+
+  <h1>The Keytab Vault: Diskless Bare-Metal Linux with AD Auth via SSSD</h1>
+  <div class="post-meta">July 2026 &middot; POC writeup &middot; full source in <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc"><code>/poc</code></a></div>
+
+  <p class="lede">
+    Physical servers that boot a pristine OS every single time, with zero local
+    disk state, that still authenticate interactive AD users through SSSD —
+    without ever leaving a long-lived secret sitting in the image. Here's the
+    architecture, why each piece exists, and the sharp edges that show up
+    once you have a fleet of mismatched hardware instead of one lab box.
+  </p>
+
+  <h2>The problem</h2>
+  <p>
+    Stateless infrastructure is easy to reason about when it's a VM or a
+    container: throw it away, boot another one, identity comes from an
+    orchestrator. Bare metal is the awkward case. There's no hypervisor to
+    hand you a fresh disk, the hardware underneath is heterogeneous (different
+    NICs, different storage controllers, different firmware), and the one
+    piece of state that traditionally <em>can't</em> be stateless — the AD
+    computer account and its Kerberos keytab — is exactly what SSSD needs
+    before a single user can log in.
+  </p>
+  <p>
+    The naive approach is <code>realm join</code> on every boot. That mutates
+    the AD computer object's password each time, litters the domain with
+    machine account churn, and means the golden image itself has to carry
+    join credentials. None of that is stateless — it just relocates the
+    state problem into Active Directory.
+  </p>
+
+  <h2>The approach: join once, fetch forever</h2>
+  <p>
+    The design splits identity into two lifecycles that never touch each
+    other:
+  </p>
+  <ul>
+    <li><strong>The AD computer object is created exactly once</strong>, out-of-band, by a staging script — not by the host itself, ever.</li>
+    <li><strong>The host fetches a copy of that keytab from a secrets manager on every boot</strong>, holds it in RAM only, and throws it away at power-off.</li>
+  </ul>
+  <p>
+    Concretely: <a href="https://infisical.com">Infisical</a> (self-hosted, Docker)
+    sits between the two. A staging host runs <code>adcli join</code> once per
+    physical server to create its AD computer object and produce a keytab,
+    base64-encodes it, and uploads it to Infisical under a key derived from
+    the hostname — plus a second alias keyed by every NIC MAC address on that
+    box, since a multi-homed server might come up on any cabled port before
+    it has a hostname assigned. The golden image never contains join
+    credentials, only a read-only, project-scoped machine identity that can
+    fetch — not create — secrets.
+  </p>
+  <p>
+    One line in <code>sssd.conf</code> makes the whole thing hold together:
+  </p>
+  <pre><code>ad_maximum_machine_account_password_age = 0</code></pre>
+  <p>
+    This disables SSSD's default machine-password rotation. Miss it, and the
+    vaulted keytab silently goes stale after 30 days when SSSD rotates the
+    password out from under it — the fetched keytab and the AD object's
+    actual password fall out of sync (KVNO mismatch), and every subsequent
+    boot fails <code>kinit</code> with <code>Preauthentication failed</code>.
+  </p>
+
+  <h2>Boot model: streamed into RAM, not written to disk</h2>
+  <p>
+    The primary boot path skips local disks entirely. A PXE ROM hits a
+    <code>dnsmasq</code> proxyDHCP instance (it coexists with the corporate
+    DHCP server — no scope changes needed), loads a small iPXE binary over
+    TFTP, and chains to an HTTP boot script that streams a squashed root
+    filesystem straight into RAM via dracut's <code>livenet</code> module.
+  </p>
+  <div class="diagram">Power on &rarr; PXE ROM &rarr; dnsmasq proxyDHCP (arch detect) &rarr; iPXE (TFTP, tiny)
+  &rarr; iPXE chains http://deploy/boot.ipxe &rarr; kernel+initrd over HTTP
+  &rarr; dracut livenet: HTTP GET root.squashfs &rarr; copied fully into RAM
+  &rarr; tmpfs OverlayFS mounted over the squashfs root &rarr; systemd
+  &rarr; network up (DHCP) &rarr; chrony syncs to DC
+  &rarr; keytab-fetch.service:
+       1. Reads hostname; falls back to boot-NIC MAC
+       2. POST /api/v1/auth/universal-auth/login  &rarr; short-lived access token
+       3. GET  /api/v3/secrets/raw/KEYTAB_&lt;HOST&gt;  (or KEYTAB_MAC_&lt;MAC&gt;)
+       4. base64 -d &rarr; /etc/krb5.keytab  (root:root 0600, tmpfs only)
+       5. Sanity check: kinit -kt /etc/krb5.keytab '&lt;HOST&gt;$@REALM'
+  &rarr; sssd.service starts &rarr; AD users can authenticate
+Reboot &rarr; ENTIRE OS discarded from RAM &rarr; keytab gone &rarr; re-streams pristine image.</div>
+  <p>
+    Every boot is the same boot. There's no per-node deployment step —
+    booting <em>is</em> deployment, and rollback is flipping a
+    <code>current</code> symlink on the image server back to the previous
+    SquashFS build. A disk-deploy fallback (OverlayFS over a written-to-disk
+    image) exists for hardware that can't RAM-boot — insufficient RAM, no
+    PXE-capable NIC — but it's explicitly the fallback, not the design
+    center.
+  </p>
+
+  <h2>Design rules for a fleet, not a lab</h2>
+  <p>
+    One golden image across mismatched physical hardware only works if it
+    stops assuming anything about the box underneath it:
+  </p>
+  <ul>
+    <li><strong>Generic initramfs.</strong> Distro dracut defaults to hostonly mode, which strips drivers the build machine doesn't need — exactly wrong for a fleet. The build forces full driver inclusion and fails the build if common RAID/NIC modules are missing.</li>
+    <li><strong>UUID/LABEL mounts only.</strong> The build script refuses to seal an image with <code>/dev/sdX</code>-style fstab entries.</li>
+    <li><strong>No NIC-specific network config.</strong> Per-interface network scripts are disabled in favor of NetworkManager's match-all DHCP, with hostname assignment left to the vault lookup rather than the network stack.</li>
+    <li><strong>Multi-NIC identity resolution.</strong> The fetch script tries every physical NIC MAC against the vault, so whichever port happens to be cabled still resolves the right host identity.</li>
+    <li><strong>Dual console output.</strong> Both the local tty and serial-over-LAN are wired up, so iDRAC/iLO consoles show boot output on every model.</li>
+    <li><strong>Per-model smoke test before fleet rollout.</strong> Gaps get fixed by adding a driver to the single image — never by forking a per-model image.</li>
+  </ul>
+
+  <h2>What "verified" means here</h2>
+  <p>
+    The POC's actual pass criterion isn't "it booted once." A verification
+    script checks the overlay is active, time is synced, the keytab landed
+    with the right principal, <code>kinit -k</code> succeeds, SSSD is healthy,
+    and an AD user resolves via <code>id</code> — then <strong>the box gets
+    rebooted and the whole check runs again</strong>. The interesting failure
+    mode isn't first boot, it's second boot: state leaking onto disk, a
+    keytab that didn't get re-fetched cleanly, or — worst case — a new AD
+    computer object appearing because something ran <code>realm join</code>
+    instead of relying on the staged keytab. A passing run confirms the AD
+    object count for a host stays at exactly one across repeated reboots.
+  </p>
+
+  <h2>Where this is intentionally a POC, not production</h2>
+  <p>
+    The machine identity's client secret for read-only vault access is baked
+    into the image in this build — acceptable in a lab, not in production.
+    The documented hardening path is conditional access / IP allowlisting on
+    the Infisical side, per-host machine identities instead of one shared
+    fleet identity, TLS with a real certificate instead of a lab endpoint,
+    and rotating the staging credentials once initial provisioning is done.
+    None of that changes the core shape of the architecture — it tightens
+    the one deliberate shortcut the POC takes.
+  </p>
+
+  <hr>
+  <p>
+    Full implementation — golden image build script, Infisical setup,
+    staging script, PXE server config, and the verification script — is in
+    <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc"><code>/poc/stateless-sssd-poc</code></a>
+    in this repo, starting with its own <code>IMPLEMENTATION_GUIDE.md</code>.
+  </p>
+
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    Written up from a working proof-of-concept. Source and scripts linked above.
+  </div>
+</footer>
+
+</body>
+</html>

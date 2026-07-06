@@ -1,0 +1,42 @@
+#cloud-config
+# cloud-init user-data — FALLBACK DISK-DEPLOY PATH ONLY (SUSE image via MAAS,
+# or /var/lib/cloud/seed/nocloud/user-data for FOG/NoCloud).
+# The primary PXE RAM-boot path needs NO cloud-init: identity + hostname come
+# from the Infisical vault keyed by NIC MAC.
+#
+# Everything heavy (packages, sssd.conf, fetch unit) is already baked into the
+# golden image by build-golden-image.sh. This file only handles per-deploy glue:
+#   - hostname (MAAS substitutes it; FOG relies on the MAC-fallback in the vault)
+#   - break-glass local user for console debugging
+#   - kernel arg for overlayroot stateless mode (Method A)
+#   - kicks the keytab fetch on first boot ordering
+
+preserve_hostname: false
+# MAAS replaces this automatically with the machine's name; keep it matching
+# the hostname used in hosts.csv when staging keytabs.
+# hostname: bm-node01
+
+users:
+  - name: pocadmin
+    groups: [sudo]
+    shell: /bin/bash
+    lock_passwd: false
+    # generate with: mkpasswd -m sha-512   (whois pkg) — REPLACE below
+    passwd: "$6$REPLACE_ME_HASH"
+    ssh_authorized_keys:
+      - "ssh-ed25519 AAAA_REPLACE_WITH_POC_ADMIN_PUBKEY"
+
+runcmd:
+  # Ensure fetch unit is enabled (idempotent; already enabled in golden image)
+  - systemctl enable keytab-fetch.service
+  # SSH: allow AD group login example (edit group name)
+  - printf '\n# POC: AD access\nAllowGroups pocadmin linux-admins\n' >> /etc/ssh/sshd_config || true
+  - systemctl restart sshd || true
+  # SUSE disk-fallback statelessness: tmpfs overlay over root from NEXT boot
+  - sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="systemd.volatile=overlay /' /etc/default/grub || true
+  - grub2-mkconfig -o /boot/grub2/grub.cfg || true
+
+final_message: |
+  POC node deployed. keytab-fetch.service will pull /etc/krb5.keytab from
+  Infisical on every boot before sssd starts. First boot after deployment is
+  read-write (cloud-init specialization); subsequent boots are stateless.
