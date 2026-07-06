@@ -4,10 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>The Keytab Vault: Diskless Bare-Metal Linux with AD Auth via SSSD</title>
-<meta name="description" content="A PXE RAM-boot architecture for stateless bare-metal Linux fleets that authenticate against Active Directory through SSSD, with secrets pulled from Infisical at every boot.">
+<meta name="description" content="I wanted bare-metal servers that boot a pristine OS every time and still let AD users log in. Here's the PXE RAM-boot + keytab vault architecture I ended up with.">
 <link rel="icon" type="image/svg+xml" href="../favicon.svg">
 <meta property="og:title" content="The Keytab Vault: Diskless Bare-Metal Linux with AD Auth via SSSD">
-<meta property="og:description" content="A PXE RAM-boot architecture for stateless bare-metal Linux fleets that authenticate against Active Directory through SSSD, with secrets pulled from Infisical at every boot.">
+<meta property="og:description" content="I wanted bare-metal servers that boot a pristine OS every time and still let AD users log in. Here's the PXE RAM-boot + keytab vault architecture I ended up with.">
 <meta property="og:type" content="article">
 <meta property="og:url" content="https://chronicblondiee.github.io/tech-blog/posts/stateless-bare-metal-linux-sssd.html">
 <meta name="twitter:card" content="summary">
@@ -35,71 +35,73 @@
   <div class="post-meta">July 2026 &middot; POC writeup &middot; full source in <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc"><code>/poc</code></a></div>
 
   <p class="lede">
-    Physical servers that boot a pristine OS every single time, with zero local
-    disk state, that still authenticate interactive AD users through SSSD —
-    without ever leaving a long-lived secret sitting in the image. Here's the
-    architecture, why each piece exists, and the sharp edges that show up
-    once you have a fleet of mismatched hardware instead of one lab box.
+    I wanted physical servers that boot a pristine OS every single time —
+    zero local disk state — and still let AD users log in through SSSD,
+    without a long-lived secret baked into the image. This is the
+    architecture I landed on, why each piece is there, and the sharp edges
+    that only show up once you're dealing with a fleet of mismatched
+    hardware instead of one friendly lab box.
   </p>
 
   <h2>The problem</h2>
   <p>
     Stateless infrastructure is easy to reason about when it's a VM or a
-    container: throw it away, boot another one, identity comes from an
-    orchestrator. Bare metal is the awkward case. There's no hypervisor to
-    hand you a fresh disk, the hardware underneath is heterogeneous (different
-    NICs, different storage controllers, different firmware), and the one
-    piece of state that traditionally <em>can't</em> be stateless — the AD
-    computer account and its Kerberos keytab — is exactly what SSSD needs
-    before a single user can log in.
+    container: throw it away, boot another one, let the orchestrator hand
+    out identity. Bare metal is the awkward one. There's no hypervisor to
+    give you a fresh disk, the hardware underneath is a grab-bag of NICs,
+    storage controllers, and firmware, and the one piece of state that
+    traditionally <em>can't</em> be stateless — the AD computer account and
+    its Kerberos keytab — is exactly what SSSD needs before a single user
+    can log in.
   </p>
   <p>
-    The naive approach is <code>realm join</code> on every boot. That mutates
-    the AD computer object's password each time, litters the domain with
-    machine account churn, and means the golden image itself has to carry
-    join credentials. None of that is stateless — it just relocates the
-    state problem into Active Directory.
+    The obvious move — <code>realm join</code> on every boot — is a trap.
+    It mutates the AD computer object's password each time, litters the
+    domain with machine-account churn, and means the golden image has to
+    carry join credentials. None of that is stateless — it just shoves the
+    state problem into Active Directory and calls it a day.
   </p>
 
   <h2>The approach: join once, fetch forever</h2>
   <p>
-    The design splits identity into two lifecycles that never touch each
-    other:
+    So I split identity into two lifecycles that never touch each other:
   </p>
   <ul>
-    <li><strong>The AD computer object is created exactly once</strong>, out-of-band, by a staging script — not by the host itself, ever.</li>
+    <li><strong>The AD computer object gets created exactly once</strong>, out-of-band, by a staging script — never by the host itself.</li>
     <li><strong>The host fetches a copy of that keytab from a secrets manager on every boot</strong>, holds it in RAM only, and throws it away at power-off.</li>
   </ul>
   <p>
-    Concretely: <a href="https://infisical.com">Infisical</a> (self-hosted, Docker)
-    sits between the two. A staging host runs <code>adcli join</code> once per
-    physical server to create its AD computer object and produce a keytab,
-    base64-encodes it, and uploads it to Infisical under a key derived from
-    the hostname — plus a second alias keyed by every NIC MAC address on that
-    box, since a multi-homed server might come up on any cabled port before
-    it has a hostname assigned. The golden image never contains join
-    credentials, only a read-only, project-scoped machine identity that can
-    fetch — not create — secrets.
+    <a href="https://infisical.com">Infisical</a> (self-hosted, runs in
+    Docker) sits in the middle. A staging host runs <code>adcli join</code>
+    once per physical server to create its AD computer object and spit out a
+    keytab, base64-encodes it, and uploads it to Infisical under a key
+    derived from the hostname. I also write a second alias keyed by every
+    NIC MAC address on the box, because a multi-homed server might come up
+    on any cabled port before it has a hostname assigned. The golden image
+    never sees join credentials — it only carries a read-only,
+    project-scoped machine identity that can fetch secrets, not create them.
   </p>
   <p>
-    One line in <code>sssd.conf</code> makes the whole thing hold together:
+    One line in <code>sssd.conf</code> holds the entire design together:
   </p>
   <pre><code>ad_maximum_machine_account_password_age = 0</code></pre>
   <p>
-    This disables SSSD's default machine-password rotation. Miss it, and the
-    vaulted keytab silently goes stale after 30 days when SSSD rotates the
-    password out from under it — the fetched keytab and the AD object's
-    actual password fall out of sync (KVNO mismatch), and every subsequent
-    boot fails <code>kinit</code> with <code>Preauthentication failed</code>.
+    This is the line that will bite you. It disables SSSD's machine-password
+    rotation — miss it and everything works beautifully for 30 days, then
+    SSSD rotates the password out from under the vault, the fetched keytab
+    and the AD object fall out of sync (KVNO mismatch), and every boot after
+    that dies in <code>kinit</code> with
+    <code>Preauthentication failed</code>.
   </p>
 
   <h2>Boot model: streamed into RAM, not written to disk</h2>
   <p>
-    The primary boot path skips local disks entirely. A PXE ROM hits a
-    <code>dnsmasq</code> proxyDHCP instance (it coexists with the corporate
-    DHCP server — no scope changes needed), loads a small iPXE binary over
-    TFTP, and chains to an HTTP boot script that streams a squashed root
-    filesystem straight into RAM via dracut's <code>livenet</code> module.
+    The boot path I actually care about skips local disks entirely. A PXE
+    ROM hits a <code>dnsmasq</code> proxyDHCP instance (it coexists with the
+    corporate DHCP server, so nobody has to touch the existing scopes),
+    loads a tiny iPXE binary over TFTP, and chains to an HTTP boot script
+    that streams a squashed root filesystem straight into RAM via dracut's
+    <code>livenet</code> module.
   </p>
   <div class="diagram">Power on &rarr; PXE ROM &rarr; dnsmasq proxyDHCP (arch detect) &rarr; iPXE (TFTP, tiny)
   &rarr; iPXE chains http://deploy/boot.ipxe &rarr; kernel+initrd over HTTP
@@ -116,67 +118,69 @@
 Reboot &rarr; ENTIRE OS discarded from RAM &rarr; keytab gone &rarr; re-streams pristine image.</div>
   <p>
     Every boot is the same boot. There's no per-node deployment step —
-    booting <em>is</em> deployment, and rollback is flipping a
+    booting <em>is</em> deployment, and rollback is me flipping a
     <code>current</code> symlink on the image server back to the previous
-    SquashFS build. A disk-deploy fallback (OverlayFS over a written-to-disk
-    image) exists for hardware that can't RAM-boot — insufficient RAM, no
-    PXE-capable NIC — but it's explicitly the fallback, not the design
-    center.
+    SquashFS build. I kept a disk-deploy fallback (OverlayFS over a
+    written-to-disk image) for hardware that can't RAM-boot — not enough
+    RAM, no PXE-capable NIC — but it's exactly that: the fallback, not the
+    design.
   </p>
 
   <h2>Design rules for a fleet, not a lab</h2>
   <p>
-    One golden image across mismatched physical hardware only works if it
-    stops assuming anything about the box underneath it:
+    One golden image across mismatched hardware only works if the image
+    stops assuming anything about the box it lands on. These are the rules
+    I ended up enforcing:
   </p>
   <ul>
-    <li><strong>Generic initramfs.</strong> Distro dracut defaults to hostonly mode, which strips drivers the build machine doesn't need — exactly wrong for a fleet. The build forces full driver inclusion and fails the build if common RAID/NIC modules are missing.</li>
+    <li><strong>Generic initramfs.</strong> Distro dracut defaults to hostonly mode, which strips every driver the build machine doesn't personally need — exactly wrong for a fleet. My build forces full driver inclusion and refuses to finish if common RAID/NIC modules are missing.</li>
     <li><strong>UUID/LABEL mounts only.</strong> The build script refuses to seal an image with <code>/dev/sdX</code>-style fstab entries.</li>
-    <li><strong>No NIC-specific network config.</strong> Per-interface network scripts are disabled in favor of NetworkManager's match-all DHCP, with hostname assignment left to the vault lookup rather than the network stack.</li>
-    <li><strong>Multi-NIC identity resolution.</strong> The fetch script tries every physical NIC MAC against the vault, so whichever port happens to be cabled still resolves the right host identity.</li>
+    <li><strong>No NIC-specific network config.</strong> Per-interface network scripts are disabled in favor of NetworkManager's match-all DHCP, and hostname assignment belongs to the vault lookup, not the network stack.</li>
+    <li><strong>Multi-NIC identity resolution.</strong> The fetch script tries every physical NIC MAC against the vault, so whichever port someone happened to cable still resolves the right host identity.</li>
     <li><strong>Dual console output.</strong> Both the local tty and serial-over-LAN are wired up, so iDRAC/iLO consoles show boot output on every model.</li>
-    <li><strong>Per-model smoke test before fleet rollout.</strong> Gaps get fixed by adding a driver to the single image — never by forking a per-model image.</li>
+    <li><strong>Per-model smoke test before fleet rollout.</strong> Gaps get fixed by adding a driver to the single image — never by forking a per-model image. That way lies madness.</li>
   </ul>
 
   <h2>What "verified" means here</h2>
   <p>
-    The POC's actual pass criterion isn't "it booted once." A verification
-    script checks the overlay is active, time is synced, the keytab landed
-    with the right principal, <code>kinit -k</code> succeeds, SSSD is healthy,
-    and an AD user resolves via <code>id</code> — then <strong>the box gets
-    rebooted and the whole check runs again</strong>. The interesting failure
-    mode isn't first boot, it's second boot: state leaking onto disk, a
-    keytab that didn't get re-fetched cleanly, or — worst case — a new AD
-    computer object appearing because something ran <code>realm join</code>
-    instead of relying on the staged keytab. A passing run confirms the AD
-    object count for a host stays at exactly one across repeated reboots.
+    My pass criterion isn't "it booted once." The verification script checks
+    that the overlay is active, time is synced, the keytab landed with the
+    right principal, <code>kinit -k</code> succeeds, SSSD is healthy, and an
+    AD user resolves via <code>id</code> — and then <strong>I reboot the box
+    and run the whole thing again</strong>. The failure mode I actually care
+    about is the second boot: state quietly leaking onto disk, a keytab that
+    didn't re-fetch cleanly, or — worst case — a brand-new AD computer
+    object showing up because something ran <code>realm join</code> behind
+    my back. A passing run means the AD object count for a host sits at
+    exactly one across repeated reboots.
   </p>
 
-  <h2>Where this is intentionally a POC, not production</h2>
+  <h2>The corners I cut (on purpose)</h2>
   <p>
-    The machine identity's client secret for read-only vault access is baked
-    into the image in this build — acceptable in a lab, not in production.
-    The documented hardening path is conditional access / IP allowlisting on
-    the Infisical side, per-host machine identities instead of one shared
-    fleet identity, TLS with a real certificate instead of a lab endpoint,
-    and rotating the staging credentials once initial provisioning is done.
-    None of that changes the core shape of the architecture — it tightens
-    the one deliberate shortcut the POC takes.
+    The big one: the machine identity's client secret for read-only vault
+    access is baked into the image. I'm fine with that in a lab; I would not
+    be fine with it in production. The hardening path is written down —
+    conditional access / IP allowlisting on the Infisical side, per-host
+    machine identities instead of one shared fleet identity, TLS with a real
+    certificate instead of a lab endpoint, and rotating the staging
+    credentials once provisioning is done. None of it changes the shape of
+    the architecture; it just tightens the one shortcut I knowingly took.
   </p>
 
   <hr>
   <p>
-    Full implementation — golden image build script, Infisical setup,
-    staging script, PXE server config, and the verification script — is in
+    If you want to poke at the real thing — the golden-image build script,
+    Infisical setup, staging script, PXE server config, and the verification
+    script — it's all in
     <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc"><code>/poc/stateless-sssd-poc</code></a>
-    in this repo, starting with its own <code>IMPLEMENTATION_GUIDE.md</code>.
+    in this repo. Start with <code>IMPLEMENTATION_GUIDE.md</code>.
   </p>
 
 </main>
 
 <footer class="site">
   <div class="wrap">
-    <span>Written up from a working proof-of-concept. Source and scripts linked above.</span>
+    <span>Thanks for reading. This came out of a working proof-of-concept — go break it and tell me what I missed.</span>
     <a href="https://github.com/chronicblondiee/tech-blog/tree/main/poc/stateless-sssd-poc">
       <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
       <span>Source</span>
